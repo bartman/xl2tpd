@@ -45,6 +45,7 @@ struct timeval *process_schedule (struct timeval *ptv)
                It is expected that p->func will free p->data
                if it is necessary */
             (*p->func) (p->data);
+	    free_poison(se, 'p', sizeof(*se));
             free (p);
         }
         else
@@ -155,6 +156,7 @@ void deschedule (struct schedule_entry *s)
             {
                 events = events->next;
             }
+	    free_poison(se, 'd', sizeof(*se));
             free (p);
             break;
         }
