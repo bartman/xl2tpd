@@ -20,6 +20,7 @@
 #define _DEFAULT_SOURCE
 #define _XOPEN_SOURCE_EXTENDED	1
 #define _GNU_SOURCE
+#define _POSIX_C_SOURCE
 
 #include <stdlib.h>
 #include <sys/types.h>
@@ -373,6 +374,68 @@ void process_signal(void)
     if (sigusr1_received) { sigusr1_received = 0; status_handler(SIGUSR1); }
     if (sighup_received) { sighup_received = 0; null_handler(SIGHUP); }
 }
+
+static char *get_proc_ent(int pid, const char *what, char *out, size_t size)
+{
+    int rc;
+    int fd;
+    ssize_t len;
+    rc = snprintf(out, size, "/proc/%d/%s", pid, what);
+    if (rc<0)
+        return NULL;
+    fd = open(out, O_RDONLY);
+    if (fd<0)
+        return NULL;
+    out[size-1] = 0;
+    len = read(fd, out, size);
+    close(fd);
+    if (len<0)
+        return NULL;
+    if(len == size || '\n' == out[len-1])
+        out[len-1] = 0;
+    return out;
+}
+
+static void dump_siginfo(const char *name, siginfo_t *si, void *ucontext)
+{
+    char bcm[1024], *killer_cm, bcl[4096], *killer_cl;
+    killer_cm = get_proc_ent(si->si_pid, "comm", bcm, sizeof(bcm));
+    killer_cl = get_proc_ent(si->si_pid, "cmdline", bcl, sizeof(bcl));
+    l2tp_log(LOG_DEBUG, "%s: si_signo=%d\n",      name, si->si_signo);
+    l2tp_log(LOG_DEBUG, "%s: si_errno=%d\n",      name, si->si_errno);
+    l2tp_log(LOG_DEBUG, "%s: si_code=%d\n",       name, si->si_code);
+    l2tp_log(LOG_DEBUG, "%s: si_pid=%d \"%s\" \"%s\"\n", name, si->si_pid,
+                                     killer_cm ?: "", killer_cl ?: "");
+    l2tp_log(LOG_DEBUG, "%s: si_uid=%d\n",       name, si->si_uid);
+    l2tp_log(LOG_DEBUG, "%s: si_status=%#x %d\n", name, si->si_status,
+                                                        si->si_status);
+    l2tp_log(LOG_DEBUG, "%s: si_addr=%p\n",       name, si->si_addr);
+    l2tp_log(LOG_DEBUG, "%s: si_fd=%p\n",         name, si->si_fd);
+    l2tp_log(LOG_DEBUG, "%s: si_call_addr=%p\n",  name, si->si_call_addr);
+    l2tp_log(LOG_DEBUG, "%s: si_syscall=%p\n",    name, si->si_syscall);
+    l2tp_log(LOG_DEBUG, "%s: si_arch=%p\n",       name, si->si_arch);
+}
+
+#define __define_siginfo_signal_handler(SIGNAME,function)                     \
+void handle_siginfo_##SIGNAME(int signal, siginfo_t *si, void *ucontext)      \
+{                                                                             \
+    const char *name = #SIGNAME;                                              \
+    if (gconfig.debug_signals) {                                              \
+        l2tp_log(LOG_DEBUG, "SIGNAL: %s: signal=%d siginfo=%p ucontext=%p\n", \
+             __FUNCTION__, signal, si, ucontext);                             \
+        if (si)                                                               \
+            dump_siginfo(name, si, ucontext);                                 \
+    }                                                                         \
+    function(SIGNAME);                                                        \
+}
+
+__define_siginfo_signal_handler(SIGTERM, death_handler);
+__define_siginfo_signal_handler(SIGINT, death_handler);
+__define_siginfo_signal_handler(SIGCHLD, child_handler);
+__define_siginfo_signal_handler(SIGUSR1, status_handler);
+__define_siginfo_signal_handler(SIGHUP, null_handler);
+
+#undef __define_siginfo_signal_handler
 
 int start_pppd (struct call *c, struct ppp_opts *opts)
 {
@@ -1680,6 +1743,7 @@ void init_args(int argc, char *argv[])
 
     gconfig.daemon=1;
     gconfig.syslog=-1;
+    gconfig.debug_signals=0;
     memset(gconfig.altauthfile,0,STRLEN);
     memset(gconfig.altconfigfile,0,STRLEN);
     memset(gconfig.authfile,0,STRLEN);
@@ -1751,6 +1815,9 @@ void init_args(int argc, char *argv[])
                 usage();
             else
                 gconfig.set_file_limit = atoi(argv[i]);
+        }
+        else if (! strcmp(argv[i],"--debug-signals")) {
+            gconfig.debug_signals=1;
         }
         else {
             usage();
@@ -1898,6 +1965,38 @@ void set_file_limit(void)
 		 lim.rlim_cur, lim.rlim_max);
 }
 
+void init_signals(void)
+{
+    int rc;
+
+    if (gconfig.debug_signals)
+        l2tp_log (LOG_INFO, "using siginfo signal handling");
+
+    signal (SIGPIPE, SIG_IGN);
+
+#define __add_siginfo_signal_handler(SIGNAME) {                               \
+    static struct sigaction action_##SIGNAME;                                 \
+    memset(&action_##SIGNAME, 0, sizeof(action_##SIGNAME));                   \
+    action_##SIGNAME.sa_sigaction = handle_siginfo_##SIGNAME;                 \
+    if (gconfig.debug_signals)                                                \
+        action_##SIGNAME.sa_flags = SA_SIGINFO;                               \
+    rc = sigaction(SIGNAME, &action_##SIGNAME, NULL);                         \
+    if (rc<0) {                                                               \
+        l2tp_log (LOG_CRIT, "%s: Unable to install siginfo handler for %s\n", \
+                  #SIGNAME);                                                  \
+        exit (1);                                                             \
+    } }
+
+    __add_siginfo_signal_handler(SIGTERM);
+    __add_siginfo_signal_handler(SIGINT);
+    __add_siginfo_signal_handler(SIGCHLD);
+    __add_siginfo_signal_handler(SIGUSR1);
+    __add_siginfo_signal_handler(SIGHUP);
+
+#undef __add_siginfo_signal_handler
+
+}
+
 void init (int argc,char *argv[])
 {
     struct lac *lac;
@@ -1928,12 +2027,8 @@ void init (int argc,char *argv[])
 
     consider_pidfile();
 
-    signal (SIGTERM, &sigterm_handler);
-    signal (SIGINT, &sigint_handler);
-    signal (SIGCHLD, &sigchld_handler);
-    signal (SIGUSR1, &sigusr1_handler);
-    signal (SIGHUP, &sighup_handler);
-    signal (SIGPIPE, SIG_IGN);
+    init_signals();
+
     init_scheduler ();
 
     unlink(gconfig.controlfile);
