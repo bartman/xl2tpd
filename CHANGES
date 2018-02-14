@@ -1,3 +1,6 @@
+v1.3.12dev1 (February 14, 2018)
+* allow select() loop to handle more than 1024 file descriptors [Bart Trojanowski]
+
 v1.3.10.1 (November 16, 2017)
 * Have max retries as a configuration [Samir Hussain]
 * Add more into to "select timeout" debug message [Samir Hussain]
