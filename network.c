@@ -355,22 +355,108 @@ void udp_xmit (struct buffer *buf, struct tunnel *t)
     }
 }
 
-int build_fdset (fd_set *readfds)
+#define FLEXIBLE_FD_SET_INIT_SIZE 1024
+#define FLEXIBLE_FD_SET_GROW_SIZE 1024
+struct flexible_fdset {
+	size_t fdsize;
+	size_t fdmax;
+	fd_set *fdset;
+};
+
+static inline void flexible_fdset_resize(struct flexible_fdset *ffs,
+					  size_t new_fdsize)
+{
+	size_t old_bytesize;
+	size_t new_bytesize;
+	size_t grow_to_fdsize;
+	void *new_p;
+
+	if (ffs->fdset && new_fdsize <= ffs->fdsize)
+		return;
+
+	/* if growing, do so by a reasonable amount */
+	grow_to_fdsize = ffs->fdsize + FLEXIBLE_FD_SET_INIT_SIZE;
+	if (new_fdsize < grow_to_fdsize)
+		new_fdsize = grow_to_fdsize;
+
+	old_bytesize = (ffs->fdsize+7) / 8;
+	new_bytesize = (new_fdsize+7) / 8;
+
+#if 0
+	l2tp_log(LOG_DEBUG, "%s: resize fdset %lu -> %lu, bytes %lu -> %lu\n",
+		 __func__, ffs->fdsize, new_fdsize, old_bytesize, new_bytesize);
+#endif
+
+	new_p = realloc(ffs->fdset, new_bytesize);
+	if (!new_p) {
+		l2tp_log(LOG_CRIT, "failed to allocate fd_set for %u descriptors: %d: %s\n",
+			 new_fdsize, errno, strerror(errno));
+		exit(EXIT_FAILURE);
+	}
+
+	/* realloc already copied the old data, but we have to zero the new data */
+	memset(new_p + old_bytesize, 0, new_bytesize - old_bytesize);
+
+	ffs->fdsize = new_fdsize;
+	ffs->fdset = new_p;
+}
+
+static inline void flexible_fdset_zero(struct flexible_fdset *ffs)
+{
+	size_t bytesize = (ffs->fdsize+7) / 8;
+	if (ffs->fdset)
+		memset(ffs->fdset, 0, bytesize);
+}
+
+static inline void flexible_fdset_set(struct flexible_fdset *ffs, int fd)
+{
+	if (fd > ffs->fdmax) {
+		ffs->fdmax = fd;
+		flexible_fdset_resize(ffs, fd+1);
+	}
+
+	{
+	volatile uint64_t *p = (void*)ffs->fdset;
+	unsigned word = fd / 64;
+	unsigned bit = fd % 64;
+	uint64_t mask = 1ULL<<bit;
+
+	p[word] |= mask;
+	}
+}
+
+static inline int flexible_fdset_isset(struct flexible_fdset *ffs, int fd)
+{
+	if (fd < 0 || fd > ffs->fdmax)
+		return 0;
+
+	{
+	volatile uint64_t *p = (void*)ffs->fdset;
+	unsigned word = fd / 64;
+	unsigned bit = fd % 64;
+	uint64_t mask = 1ULL<<bit;
+
+	return p[word] & mask;
+	}
+}
+
+int build_fdset (struct flexible_fdset *ffs)
 {
     struct tunnel *tun;
     struct call *call;
-    int max = 0;
+
+    /* initialize it to something large */
+    flexible_fdset_resize(ffs, FLEXIBLE_FD_SET_INIT_SIZE);
+
+    flexible_fdset_zero(ffs);
+    ffs->fdmax = 0;
 
     tun = tunnels.head;
-    FD_ZERO (readfds);
-
     while (tun)
     {
-        if (tun->udp_fd > -1) {
-            if (tun->udp_fd > max)
-                max = tun->udp_fd;
-            FD_SET (tun->udp_fd, readfds);
-        }
+        if (tun->udp_fd > -1)
+            flexible_fdset_set (ffs, tun->udp_fd);
+
         call = tun->call_head;
         while (call)
         {
@@ -385,11 +471,7 @@ int build_fdset (fd_set *readfds)
             if (call->fd > -1)
             {
                 if (!call->needclose && !call->closing)
-                {
-                    if (call->fd > max)
-                        max = call->fd;
-                    FD_SET (call->fd, readfds);
-                }
+                    flexible_fdset_set (ffs, call->fd);
             }
             call = call->next;
         }
@@ -411,13 +493,11 @@ int build_fdset (fd_set *readfds)
         }
         tun = tun->next;
     }
-    FD_SET (server_socket, readfds);
-    if (server_socket > max)
-        max = server_socket;
-    FD_SET (control_fd, readfds);
-    if (control_fd > max)
-        max = control_fd;
-    return max;
+
+    flexible_fdset_set (ffs, server_socket);
+    flexible_fdset_set (ffs, control_fd);
+
+    return ffs->fdmax;
 }
 
 void network_thread ()
@@ -434,7 +514,7 @@ void network_thread ()
     struct buffer *buf;         /* Payload buffer */
     struct call *c, *sc;        /* Call to send this off to */
     struct tunnel *st;          /* Tunnel */
-    fd_set readfds;             /* Descriptors to watch for reading */
+    struct flexible_fdset rffs; /* Descriptors to watch for reading */
     int max;                    /* Highest fd */
     struct timeval tv, *ptv;    /* Timeout for select */
     struct msghdr msgh;
@@ -450,13 +530,23 @@ void network_thread ()
     tunnel = 0;
     call = 0;
 
+    memset(&rffs, 0, sizeof(rffs));
+
     for (;;)
     {
         int ret;
         process_signal();
-        max = build_fdset (&readfds);
+        max = build_fdset (&rffs);
+
+
         ptv = process_schedule(&tv);
-        ret = select (max + 1, &readfds, NULL, NULL, ptv);
+        ret = select (max + 1, rffs.fdset, NULL, NULL, ptv);
+
+#if 0
+	l2tp_log(LOG_DEBUG, "%s: select(%u, {size=%u,max=%u}, ) = %d\n",
+		 __func__, max+1, rffs.fdsize, rffs.fdmax, ret);
+#endif
+
         if (ret <= 0)
         {
             if (ret == 0)
@@ -479,7 +569,7 @@ void network_thread ()
             }
             continue;
         }
-        if (FD_ISSET (control_fd, &readfds))
+        if (flexible_fdset_isset (&rffs, control_fd))
         {
             do_control ();
         }
@@ -498,7 +588,7 @@ void network_thread ()
                 currentfd = &server_socket;
                 server_socket_processed = 1;
             }
-            if (FD_ISSET (*currentfd, &readfds))
+            if (flexible_fdset_isset (&rffs, *currentfd))
             {
                 /*
                  * Okay, now we're ready for reading and processing new data.
@@ -662,7 +752,7 @@ void network_thread ()
             sc = st->call_head;
             while (sc)
             {
-                if ((sc->fd >= 0) && FD_ISSET (sc->fd, &readfds))
+                if ((sc->fd >= 0) && flexible_fdset_isset (&rffs, sc->fd))
                 {
                     /* Got some payload to send */
                     int result;
@@ -702,6 +792,8 @@ void network_thread ()
         }
     }
 
+    if (rffs.fdset)
+	    free(rffs.fdset);
 }
 
 #ifdef USE_KERNEL
